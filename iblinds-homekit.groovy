@@ -11,11 +11,18 @@
  *  for the specific language governing permissions and limitations under the License.
  *
  */
+ 
+ /**
+ *  Note: This Device Handler limits the range of motion on iBlinds to operate more seamlessly with HomeKit, Homebridge,
+ *  and the SmartThings V2 Homebridge plugin. It's largely adapted from the official iBlinds device handler. I'm not
+ *  proud of some of the code, but it's the best I could do with ~Groovy~ in a short amount of time. It is what it is.
+ */
+ 
 import groovy.json.JsonOutput
 
 
 metadata {
-    definition (name: "iblinds Z-Wave", namespace: "iblinds", author: "HABHomeIntel", ocfDeviceType: "oic.d.blind",  mnmn: "SmartThings", vid: "generic-shade-3") {
+    definition (name: "iBlinds HomeKit", namespace: "iBlinds", author: "Harry Shamansky", ocfDeviceType: "oic.d.blind",  mnmn: "SmartThings", vid: "generic-shade-3") {
 
 		capability "Switch Level" 
 		capability "Switch" 
@@ -78,7 +85,6 @@ metadata {
 
 		preferences {
 			input "preset", "number", title: "Preset position", defaultValue: 50, range: "1..99", required: false, displayDuringSetup: false
-			input "reverse", "bool", title: "Reverse", description: "Reverse Blind Direction",defaultValue: false, required: false , displayDuringSetup: false 
 		}
 
 		main(["windowShade"])
@@ -135,8 +141,8 @@ def zwaveEvent(physicalgraph.zwave.commands.switchmultilevelv3.SwitchMultilevelR
 private handleLevelReport(physicalgraph.zwave.Command cmd) {
 	def descriptionText = null
 	def shadeValue = null
-	def level = cmd.value as Integer
-
+	def level = blindsToHomeKit(cmd.value) as Integer
+    
 	if (!state.lastbatt || now() - state.lastbatt > 24 * 60 * 60 * 1000) {
 		log.debug "requesting battery"
 		state.lastbatt = (now() - 23 * 60 * 60 * 1000) // don't queue up multiple battery reqs in a row
@@ -146,7 +152,7 @@ private handleLevelReport(physicalgraph.zwave.Command cmd) {
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.switchmultilevelv3.SwitchMultilevelStopLevelChange cmd) {
-	[ createEvent(name: "windowShade", value: "partially open", displayed: false, descriptionText: "$device.displayName shade stopped"),  response(zwave.switchMultilevelV1.switchMultilevelGet().format()) ]
+	[ createEvent(name: "windowShade", value: "partially open", displayed: false, descriptionText: "$device.displayName shade stopped"),  response(blindsToHomeKit(zwave.switchMultilevelV1.switchMultilevelGet().format())) ]
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.manufacturerspecificv2.ManufacturerSpecificReport cmd) {
@@ -178,27 +184,24 @@ def zwaveEvent(physicalgraph.zwave.Command cmd) {
 
 def open() {
 	log.debug "open()"
-	// Blinds fully open at 50% 
-	level =50  
+	runIn(5, updateStatusToOpen)
+	zwave.switchMultilevelV3.switchMultilevelSet(value: homeKitToBlinds(100)).format()
+}
+
+def updateStatusToOpen() {
 	sendEvent(name: "windowShade", value: "open")
-	sendEvent(name: "level", value: 50, unit: "%",displayed: true) 
-	zwave.switchMultilevelV3.switchMultilevelSet(value: 50).format()
+	sendEvent(name: "level", value: 100, unit: "%", displayed: true) 
 }
 
 def close() {
 	log.debug "close()"
-	   
-	if(reverse){
-		 sendEvent(name: "windowShade", value: "closed")
-		 sendEvent(name: "level", value: 0, unit: "%",displayed: true) 
-		 zwave.switchMultilevelV3.switchMultilevelSet(value: 0x63).format()
+    runIn(5, updateStatusToClosed)
+	zwave.switchMultilevelV3.switchMultilevelSet(value: homeKitToBlinds(0)).format()
+}
 
-	} else 
-	{
-		 sendEvent(name: "windowShade", value: "closed")
-		 sendEvent(name: "level", value: 0, unit: "%",displayed: true) 
-		 zwave.switchMultilevelV3.switchMultilevelSet(value: 0).format()
-	}
+def updateStatusToClosed() {
+	sendEvent(name: "windowShade", value: "closed")
+	sendEvent(name: "level", value: 0, unit: "%", displayed: true) 
 }
 
 def setLevel(value, duration = null) {
@@ -207,34 +210,23 @@ def setLevel(value, duration = null) {
 
 	log.debug "setLevel(${value.inspect()})"
 	Integer level = value as Integer
-	 
-	if (level < 0) level = 0
-	if (level > 99) level = 99
-	Integer tiltLevel = level as Integer //we will use this value to decide what level is sent to device (reverse or not reversed)
-
-	if(reverse)  // Check to see if user wants blinds to operate in reverse direction
-	{
-		tiltLevel = 99 - level
-	}
        
-	if (level <= 0) 
-	{
-		//level =0  
-		sendEvent(name: "windowShade", value: "closed")
-	} else if (level >= 99) {
-		level = 99  
-		sendEvent(name: "windowShade", value: "closed")
-	} else if (level == 50) {
-	   // level = 50  
-		sendEvent(name: "windowShade", value: "open")
+	if (level <= 0) {
+        level = 0
+		// delay the status update to account for the runtime of the motor
+        runIn(5, updateStatusToClosed)
+	} else if (level >= 100) {
+		level = 100
+        // delay the status update to account for the runtime of the motor
+        runIn(5, updateStatusToOpen)
 	} else {
-		descriptionText = "${device.displayName} tilt level is ${level}% open"   
-		sendEvent(name: "windowShade", value: "partially open" , descriptionText: descriptionText) //, isStateChange: levelEvent.isStateChange )
+		descriptionText = "${device.displayName} tilt level is ${level}% open"
+        // I tried delaying the status update here, but this never seemed to work, so I'm leaving it as instantaneous
+		sendEvent(name: "windowShade", value: "partially open" , descriptionText: descriptionText)
+    	sendEvent(name: "level", value: level,  descriptionText: descriptionText)
 	}
-	//log.debug "Level - ${level}%  & Tilt Level - ${tiltLevel}%"
-	sendEvent(name: "level", value: level,  descriptionText: descriptionText) 
-	zwave.switchMultilevelV3.switchMultilevelSet(value: tiltLevel).format()
-
+	
+	zwave.switchMultilevelV3.switchMultilevelSet(value: homeKitToBlinds(level)).format()
 }
 
 def presetPosition() {
@@ -248,7 +240,7 @@ def pause() {
 
 def stop() {
 	log.debug "stop()"
-	zwave.switchMultilevelV3.switchMultilevelStopLevelChange().format()
+	blindsToHomeKit(zwave.switchMultilevelV3.switchMultilevelStopLevelChange().format())
 }
 
 def ping() {
@@ -258,7 +250,21 @@ def ping() {
 def refresh() {
 	log.debug "refresh()"
 	delayBetween([
-		zwave.switchMultilevelV1.switchMultilevelGet().format(),
+		blindsToHomeKit(zwave.switchMultilevelV1.switchMultilevelGet().format()),
 		zwave.batteryV1.batteryGet().format()
 	], 1500)
+}
+
+// Converts the HomeKit percentage (0-100) to the value sent to iBlinds
+int homeKitToBlinds(value) {
+	int kBlindsClosedValue = 99
+    int kBlindsOpenValue = 41
+    return (int)(kBlindsClosedValue - (((double)value / 100.0) * (kBlindsClosedValue - kBlindsOpenValue)))
+}
+
+// Converts the iBlinds value to a HomeKit percentage (0-100)
+int blindsToHomeKit(value) {
+	int kBlindsClosedValue = 99
+    int kBlindsOpenValue = 41
+    return (int)(((double)(kBlindsClosedValue - value) / (kBlindsClosedValue - kBlindsOpenValue)) * 100.0)
 }
